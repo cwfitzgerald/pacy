@@ -1,14 +1,13 @@
 [package]
 name = "pacy"
-version = "0.0.0"
-edition = "2021"
 description = "Frame Timing and Pacing Library"
-license = "MIT OR Apache-2.0 OR Zlib"
-repository = "https://github.com/BVE-Reborn/pacy"
+
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-log = "0.4"
-profiling = "1"
-spin_sleep = "1"

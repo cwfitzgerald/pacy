@@ -1,3 +1,15 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["examples/*", "pacy*"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Connor Fitzgerald <connorwadefitzgerald@gmail.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0 OR Zlib"
+repository = "https://github.com/cwfitzgerald/pacy"
+rust-version = "1.89"
+
+[workspace.lints]
+
+[workspace.dependencies]
