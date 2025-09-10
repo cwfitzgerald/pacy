@@ -16,7 +16,7 @@ use windows::{
             },
             Gdi::{DEVMODEA, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsA},
         },
-        System::WindowsProgramming::QueryInterruptTime,
+        System::Performance::QueryPerformanceCounter,
         UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
     },
     core::{Interface as _, PCSTR},
@@ -80,25 +80,18 @@ impl Win11TimeDriver {
                         );
                     }
 
-                    std::thread::spawn(move || {
-                        let mut last_time = Instant::now();
-                        loop {
-                            output6.WaitForVBlank().unwrap();
-
-                            let now = Instant::now();
-                            let diff = now.duration_since(last_time);
-                            last_time = now;
-                            println!("VBlank {}: {:?}", output_idx, diff);
-                        }
-                    });
-
                     output_idx += 1;
                     total_outputs += 1;
                 }
                 adapter_idx += 1;
             }
 
-            let _timings = DCompositionTimings::new(total_outputs)?;
+            let timings = DCompositionTimings::new(total_outputs).unwrap();
+
+            println!(
+                "Compositor running at {} Hz",
+                10_000_000.0 / (timings.frame_stats.framePeriod) as f32
+            );
         }
 
         Ok(Self {})
@@ -188,7 +181,6 @@ impl DCompositionTimings {
 
             assert_eq!(target_id_count, count);
 
-            let qtp_now = QueryInterruptTime();
             let int_now = current_interrupt_time();
 
             let mut target_stats = Vec::new();
@@ -200,8 +192,6 @@ impl DCompositionTimings {
 
             let elapsed = now.elapsed();
             println!("DCompositionTimings::new took {:?}", elapsed);
-
-            dbg!(qtp_now, frame_stats);
 
             let start_time = duration_from_interrupt_time(frame_stats.startTime);
             let target_time = duration_from_interrupt_time(frame_stats.targetTime);
@@ -244,7 +234,9 @@ fn duration_from_interrupt_time(ticks: u64) -> std::time::Duration {
 }
 
 fn current_interrupt_time() -> std::time::Duration {
-    duration_from_interrupt_time(unsafe { QueryInterruptTime() })
+    let mut count = 0;
+    unsafe { QueryPerformanceCounter(&mut count).unwrap() };
+    duration_from_interrupt_time(count as u64)
 }
 
 struct ComparisonTime {
