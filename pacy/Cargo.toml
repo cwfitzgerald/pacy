@@ -14,13 +14,4 @@ repository.workspace = true
 thiserror.workspace = true
 
 [target."cfg(windows)".dependencies]
-windows = { workspace = true, features = [
-    "Win32_Graphics_DirectComposition",
-    "Win32_Graphics_CompositionSwapchain",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Gdi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_UI_HiDpi",
-    "Win32_System_WindowsProgramming",
-    "Win32_System_Performance",
-] }
+windows = { workspace = true, features = ["Win32_Graphics_DirectComposition", "Win32_Graphics_CompositionSwapchain", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Graphics_Dxgi_Common", "Win32_UI_HiDpi", "Win32_System_WindowsProgramming", "Win32_System_Performance", "Win32_Graphics_Dwm", "Win32_Security", "Win32_System_Threading"] }

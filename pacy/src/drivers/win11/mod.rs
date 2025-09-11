@@ -1,26 +1,33 @@
-use std::{ffi::CString, fmt::Display, time::Instant};
+use std::{
+    ffi::CString,
+    fmt::Display,
+    sync::{Arc, Mutex},
+};
 
 use thiserror::Error;
 use windows::{
     Win32::{
-        Foundation::TRUE,
+        Foundation::{HANDLE, TRUE, WAIT_OBJECT_0},
         Graphics::{
             DirectComposition::{
                 COMPOSITION_FRAME_ID_COMPLETED, COMPOSITION_FRAME_STATS, COMPOSITION_TARGET_ID,
                 COMPOSITION_TARGET_STATS, DCompositionGetFrameId, DCompositionGetStatistics,
-                DCompositionGetTargetStatistics,
+                DCompositionGetTargetStatistics, DCompositionWaitForCompositorClock,
             },
             Dxgi::{
                 Common::DXGI_FORMAT_R8G8B8A8_UNORM, CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS,
-                DXGI_ENUM_MODES_SCALING, DXGI_MODE_DESC1, IDXGIFactory7, IDXGIOutput6,
+                DXGI_ENUM_MODES_SCALING, DXGI_MODE_DESC1, DXGI_OUTPUT_DESC1, IDXGIFactory7,
+                IDXGIOutput6,
             },
             Gdi::{DEVMODEA, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsA},
         },
-        System::Performance::QueryPerformanceCounter,
+        System::{Performance::QueryPerformanceCounter, Threading::CreateEventA},
         UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
     },
     core::{Interface as _, PCSTR},
 };
+
+use crate::drivers::TimeDriver;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -38,7 +45,12 @@ pub enum Win11TimeDriverError {
     NoMatchingDisplayMode,
 }
 
-pub struct Win11TimeDriver {}
+pub struct Win11TimeDriver {
+    outputs: Vec<Output>,
+    frame_stats: Arc<Mutex<DCompositionTimings>>,
+    stop_event: HANDLE,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Win11TimeDriver {
     pub fn new() -> Result<Self, Win11TimeDriverError> {
@@ -49,7 +61,7 @@ impl Win11TimeDriver {
             let factory: IDXGIFactory7 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS::default())
                 .map_err(Win11TimeDriverError::CreateDXGIFactory)?;
 
-            let mut total_outputs = 0u32;
+            let mut outputs = Vec::new();
 
             let mut adapter_idx = 0;
             while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
@@ -78,24 +90,115 @@ impl Win11TimeDriver {
                             found_mode.RefreshRate.Numerator as f32
                                 / found_mode.RefreshRate.Denominator as f32
                         );
+
+                        outputs.push(Output {
+                            inner: output6,
+                            desc: output_desc,
+                            mode: found_mode,
+                        });
                     }
 
                     output_idx += 1;
-                    total_outputs += 1;
                 }
                 adapter_idx += 1;
             }
 
-            let timings = DCompositionTimings::new(total_outputs).unwrap();
+            let timings = DCompositionTimings::new(outputs.len() as u32).unwrap();
 
-            println!(
-                "Compositor running at {} Hz",
-                10_000_000.0 / (timings.frame_stats.framePeriod) as f32
-            );
+            let frame_stats = Arc::new(Mutex::new(timings));
+
+            let stop_event = CreateEventA(None, true, false, None).unwrap();
+
+            let thread = {
+                let frame_stats = frame_stats.clone();
+                let stop_event = SendSyncWrapper(stop_event);
+                let count = outputs.len() as u32;
+
+                std::thread::spawn(move || {
+                    // We need to bind the send_sync wrapper explicitly, otherwise only
+                    // stop_event.0 will get moved in, and that is not Send + Sync.
+                    let s = stop_event;
+                    Self::thread(frame_stats, s.0, count);
+                })
+            };
+
+            Ok(Self {
+                outputs,
+                stop_event,
+                thread: Some(thread),
+                frame_stats,
+            })
         }
-
-        Ok(Self {})
     }
+
+    fn thread(frame_stats: Arc<Mutex<DCompositionTimings>>, stop_event: HANDLE, count: u32) {
+        loop {
+            let res = unsafe { DCompositionWaitForCompositorClock(Some(&[stop_event]), 100) };
+
+            if res == WAIT_OBJECT_0.0 {
+                println!("Stopping timing thread");
+                // Our stop event was signaled.
+                break;
+            }
+
+            if res != WAIT_OBJECT_0.0 + 1 {
+                println!("Error occurred");
+                // Some error occurred.
+                break;
+            }
+
+            if let Ok(new_stats) = DCompositionTimings::new(count) {
+                *frame_stats.lock().unwrap() = new_stats;
+            }
+        }
+    }
+}
+
+impl TimeDriver for Win11TimeDriver {
+    fn next_presentation(&self) -> super::FuturePresentation {
+        let timings = self.frame_stats.lock().unwrap().clone();
+
+        // TODO: Figure out which screen/compositor to use. For now using the zeroth monitor.
+        let target_stats = &timings.target_stats[0];
+        let output = &self.outputs[0];
+
+        let now = current_time();
+        let last_vsync = duration_from_qpc_time(target_stats.presentedStats.time);
+        let vsync_duration = std::time::Duration::from_nanos(
+            ((1_000_000_000u128 * output.mode.RefreshRate.Denominator as u128)
+                / output.mode.RefreshRate.Numerator as u128) as u64,
+        );
+
+        let intervals_behind = (now - last_vsync)
+            .as_nanos()
+            .div_ceil(vsync_duration.as_nanos());
+        let next_present = last_vsync + vsync_duration * (intervals_behind as u32);
+
+        super::FuturePresentation {
+            now,
+            soonest_presentation: next_present,
+            latest_presentation: next_present,
+            display_interval: super::DisplayInterval {
+                interval: vsync_duration,
+                vrr_range: None,
+            },
+        }
+    }
+}
+
+impl Drop for Win11TimeDriver {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Threading::SetEvent(self.stop_event).unwrap();
+        }
+        let _ = self.thread.take().unwrap().join();
+    }
+}
+
+struct Output {
+    inner: IDXGIOutput6,
+    desc: DXGI_OUTPUT_DESC1,
+    mode: DXGI_MODE_DESC1,
 }
 
 fn get_active_mode(
@@ -119,6 +222,7 @@ fn get_active_mode(
             }
         }
         let mut num_modes = 0;
+
         output6
             .GetDisplayModeList1(
                 DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -154,6 +258,7 @@ fn get_active_mode(
     }
 }
 
+#[derive(Debug, Clone)]
 struct DCompositionTimings {
     frame_stats: COMPOSITION_FRAME_STATS,
     target_stats: Vec<COMPOSITION_TARGET_STATS>,
@@ -162,7 +267,6 @@ struct DCompositionTimings {
 impl DCompositionTimings {
     fn new(count: u32) -> Result<Self, Win11TimeDriverError> {
         unsafe {
-            let now = Instant::now();
             let composition_frame_id =
                 DCompositionGetFrameId(COMPOSITION_FRAME_ID_COMPLETED).unwrap();
 
@@ -181,38 +285,10 @@ impl DCompositionTimings {
 
             assert_eq!(target_id_count, count);
 
-            let int_now = current_interrupt_time();
-
             let mut target_stats = Vec::new();
             for target_id in &target_ids {
                 target_stats.push(
                     DCompositionGetTargetStatistics(composition_frame_id, target_id).unwrap(),
-                );
-            }
-
-            let elapsed = now.elapsed();
-            println!("DCompositionTimings::new took {:?}", elapsed);
-
-            let start_time = duration_from_interrupt_time(frame_stats.startTime);
-            let target_time = duration_from_interrupt_time(frame_stats.targetTime);
-
-            println!(
-                "Frame Stats: Start: {} - Target: {}",
-                ComparisonTime::new(int_now, start_time),
-                ComparisonTime::new(int_now, target_time)
-            );
-
-            for (i, stat) in target_stats.iter_mut().enumerate() {
-                let last_present = duration_from_interrupt_time(stat.presentTime);
-                let vblank_duration = duration_from_interrupt_time(stat.vblankDuration);
-                let last_presented_time = duration_from_interrupt_time(stat.presentedStats.time);
-
-                let last_present_cmp = ComparisonTime::new(int_now, last_present);
-                let last_presented_cmp = ComparisonTime::new(int_now, last_presented_time);
-
-                println!(
-                    "{i} VBlank Duration: {:?}, Last Present: {} - Last Presented: {}",
-                    vblank_duration, last_present_cmp, last_presented_cmp
                 );
             }
 
@@ -224,40 +300,22 @@ impl DCompositionTimings {
     }
 }
 
+struct SendSyncWrapper<T>(T);
+
+unsafe impl<T> Send for SendSyncWrapper<T> {}
+unsafe impl<T> Sync for SendSyncWrapper<T> {}
+
 fn string_from_utf16_nul(data: &[u16]) -> String {
     let len = data.iter().position(|&c| c == 0).unwrap_or(data.len());
     String::from_utf16_lossy(&data[..len])
 }
 
-fn duration_from_interrupt_time(ticks: u64) -> std::time::Duration {
+fn duration_from_qpc_time(ticks: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(ticks * 100)
 }
 
-fn current_interrupt_time() -> std::time::Duration {
+fn current_time() -> std::time::Duration {
     let mut count = 0;
     unsafe { QueryPerformanceCounter(&mut count).unwrap() };
-    duration_from_interrupt_time(count as u64)
-}
-
-struct ComparisonTime {
-    now: std::time::Duration,
-    time: std::time::Duration,
-}
-
-impl ComparisonTime {
-    fn new(now: std::time::Duration, time: std::time::Duration) -> Self {
-        Self { now, time }
-    }
-}
-
-impl Display for ComparisonTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.now > self.time {
-            let diff = self.now - self.time;
-            write!(f, "{:?} ago", diff)
-        } else {
-            let diff = self.time - self.now;
-            write!(f, "in {:?}", diff)
-        }
-    }
+    duration_from_qpc_time(count as u64)
 }
