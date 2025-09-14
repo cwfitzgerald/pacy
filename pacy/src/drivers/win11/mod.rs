@@ -1,7 +1,8 @@
 use std::{
     ffi::CString,
     fmt::Display,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -21,7 +22,10 @@ use windows::{
             },
             Gdi::{DEVMODEA, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsA},
         },
-        System::{Performance::QueryPerformanceCounter, Threading::CreateEventA},
+        System::{
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+            Threading::CreateEventA,
+        },
         UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
     },
     core::{Interface as _, PCSTR},
@@ -162,8 +166,8 @@ impl TimeDriver for Win11TimeDriver {
         let target_stats = &timings.target_stats[0];
         let output = &self.outputs[0];
 
-        let now = current_time();
-        let last_vsync = duration_from_qpc_time(target_stats.presentedStats.time);
+        let now = Duration::now_qpc();
+        let last_vsync = Duration::from_qpc(target_stats.presentedStats.time);
         let vsync_duration = std::time::Duration::from_nanos(
             ((1_000_000_000u128 * output.mode.RefreshRate.Denominator as u128)
                 / output.mode.RefreshRate.Numerator as u128) as u64,
@@ -189,7 +193,7 @@ impl TimeDriver for Win11TimeDriver {
 impl Drop for Win11TimeDriver {
     fn drop(&mut self) {
         unsafe {
-            windows::Win32::System::Threading::SetEvent(self.stop_event).unwrap();
+            let _ = windows::Win32::System::Threading::SetEvent(self.stop_event);
         }
         let _ = self.thread.take().unwrap().join();
     }
@@ -310,12 +314,48 @@ fn string_from_utf16_nul(data: &[u16]) -> String {
     String::from_utf16_lossy(&data[..len])
 }
 
-fn duration_from_qpc_time(ticks: u64) -> std::time::Duration {
-    std::time::Duration::from_nanos(ticks * 100)
+static QPC_FREQUENCY: OnceLock<u64> = OnceLock::new();
+
+fn get_frequency() -> u64 {
+    let freq = *QPC_FREQUENCY.get_or_init(|| {
+        let mut freq = 0;
+        unsafe { QueryPerformanceFrequency(&mut freq).unwrap() };
+        freq as u64
+    });
+
+    freq
 }
 
-fn current_time() -> std::time::Duration {
-    let mut count = 0;
-    unsafe { QueryPerformanceCounter(&mut count).unwrap() };
-    duration_from_qpc_time(count as u64)
+pub trait DurationExt {
+    fn now_qpc() -> Self;
+    fn from_qpc(ticks: u64) -> Self;
+    fn to_qpc(&self) -> u64;
+}
+
+impl DurationExt for std::time::Duration {
+    fn now_qpc() -> Self {
+        let mut count = 0;
+        unsafe { QueryPerformanceCounter(&mut count).unwrap() };
+
+        Self::from_qpc(count as u64)
+    }
+
+    fn from_qpc(ticks: u64) -> Self {
+        let frequency = get_frequency();
+
+        if frequency == 10_000_000 {
+            // 100ns intervals, can convert directly to Duration
+            std::time::Duration::from_nanos(ticks * 100)
+        } else {
+            // Convert to nanoseconds first
+            let nanos = (ticks as u128 * 1_000_000_000u128) / (frequency as u128);
+            let seconds = (nanos / 1_000_000_000) as u64;
+            let nanos = (nanos % 1_000_000_000) as u32;
+            std::time::Duration::new(seconds, nanos)
+        }
+    }
+
+    fn to_qpc(&self) -> u64 {
+        self.as_nanos() as u64 / 100
+    }
 }
