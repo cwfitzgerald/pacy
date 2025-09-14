@@ -59,9 +59,6 @@ pub struct Win11TimeDriver {
 impl Win11TimeDriver {
     pub fn new() -> Result<Self, Win11TimeDriverError> {
         unsafe {
-            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-                .map_err(Win11TimeDriverError::DpiAwareness)?;
-
             let factory: IDXGIFactory7 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS::default())
                 .map_err(Win11TimeDriverError::CreateDXGIFactory)?;
 
