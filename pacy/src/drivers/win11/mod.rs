@@ -1,6 +1,5 @@
 use std::{
     ffi::CString,
-    fmt::Display,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -31,14 +30,11 @@ use windows::{
     core::{Interface as _, PCSTR},
 };
 
-use crate::drivers::TimeDriver;
+use crate::drivers::{TimeDriver, TimingTarget};
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Win11TimeDriverError {
-    #[error("Error inside SetProcessDpiAwarenessContext")]
-    DpiAwareness(#[source] windows::core::Error),
-
     #[error("Error creating DXGI factory")]
     CreateDXGIFactory(#[source] windows::core::Error),
     #[error("Error inside EnumDisplaySettingsA")]
@@ -59,6 +55,8 @@ pub struct Win11TimeDriver {
 impl Win11TimeDriver {
     pub fn new() -> Result<Self, Win11TimeDriverError> {
         unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
             let factory: IDXGIFactory7 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS::default())
                 .map_err(Win11TimeDriverError::CreateDXGIFactory)?;
 
@@ -92,8 +90,16 @@ impl Win11TimeDriver {
                                 / found_mode.RefreshRate.Denominator as f32
                         );
 
+                        println!(
+                            "  Coordinates: left {}, top {}, right {}, bottom {}",
+                            output_desc.DesktopCoordinates.left,
+                            output_desc.DesktopCoordinates.top,
+                            output_desc.DesktopCoordinates.right,
+                            output_desc.DesktopCoordinates.bottom
+                        );
+
                         outputs.push(Output {
-                            inner: output6,
+                            _inner: output6,
                             desc: output_desc,
                             mode: found_mode,
                         });
@@ -156,19 +162,42 @@ impl Win11TimeDriver {
 }
 
 impl TimeDriver for Win11TimeDriver {
-    fn next_presentation(&self) -> super::FuturePresentation {
+    fn get_timing_target(&self, rect: super::Rect) -> super::TimingTarget {
+        for (i, output) in self.outputs.iter().enumerate() {
+            let coords = &output.desc.DesktopCoordinates;
+            let ox = coords.left;
+            let oy = coords.top;
+            let ow = coords.right - coords.left;
+            let oh = coords.bottom - coords.top;
+
+            if rect.x == ox && rect.y == oy && rect.width == ow && rect.height == oh {
+                return super::TimingTarget::Monitor(i as u32);
+            }
+        }
+
+        super::TimingTarget::Compositor
+    }
+
+    fn next_presentation(&self, monitor: TimingTarget) -> super::FuturePresentation {
         let timings = self.frame_stats.lock().unwrap().clone();
 
-        // TODO: Figure out which screen/compositor to use. For now using the zeroth monitor.
-        let target_stats = &timings.target_stats[0];
-        let output = &self.outputs[0];
+        let last_vsync_qpc = match monitor {
+            TimingTarget::Compositor => timings.frame_stats.targetTime,
+            TimingTarget::Monitor(i) => timings.target_stats[i as usize].presentedStats.time,
+        };
+        let last_vsync = Duration::from_qpc(last_vsync_qpc);
 
         let now = Duration::now_qpc();
-        let last_vsync = Duration::from_qpc(target_stats.presentedStats.time);
-        let vsync_duration = std::time::Duration::from_nanos(
-            ((1_000_000_000u128 * output.mode.RefreshRate.Denominator as u128)
-                / output.mode.RefreshRate.Numerator as u128) as u64,
-        );
+        let vsync_duration = match monitor {
+            TimingTarget::Compositor => Duration::from_qpc(timings.frame_stats.framePeriod),
+            TimingTarget::Monitor(i) => {
+                let output = &self.outputs[i as usize];
+                std::time::Duration::from_nanos(
+                    ((1_000_000_000u128 * output.mode.RefreshRate.Denominator as u128)
+                        / output.mode.RefreshRate.Numerator as u128) as u64,
+                )
+            }
+        };
 
         let intervals_behind = (now - last_vsync)
             .as_nanos()
@@ -197,7 +226,7 @@ impl Drop for Win11TimeDriver {
 }
 
 struct Output {
-    inner: IDXGIOutput6,
+    _inner: IDXGIOutput6,
     desc: DXGI_OUTPUT_DESC1,
     mode: DXGI_MODE_DESC1,
 }

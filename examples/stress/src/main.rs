@@ -4,7 +4,7 @@ fn main() {
     let driver = pacy::drivers::win11::Win11TimeDriver::new().unwrap();
 
     for _ in 0..10 {
-        let pres = driver.next_presentation();
+        let pres = driver.next_presentation(pacy::drivers::TimingTarget::Monitor(0));
         println!(
             "Now: {:?} Soonest: {:?}, Latest: {:?}, Interval: {:?}",
             pres.now,
