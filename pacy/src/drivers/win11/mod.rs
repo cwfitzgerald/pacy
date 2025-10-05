@@ -52,6 +52,9 @@ pub struct Win11TimeDriver {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+unsafe impl Send for Win11TimeDriver {}
+unsafe impl Sync for Win11TimeDriver {}
+
 impl Win11TimeDriver {
     pub fn new() -> Result<Self, Win11TimeDriverError> {
         unsafe {
